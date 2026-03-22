@@ -1,3 +1,6 @@
 [submodule "autoresearch"]
 	path = autoresearch
 	url = git@github.com:karpathy/autoresearch.git
+[submodule ".claude"]
+	path = .claude
+	url = git@github.com:winksaville/ar-rs-x1.claude.git
