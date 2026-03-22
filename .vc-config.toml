@@ -1,0 +1,10 @@
+$ cat .vc-config.toml 
+# vc-config: Vibe Coding workspace configuration
+#
+# workspace-path is this repo's path relative to the workspace root.
+# Used to resolve changeID paths in git trailers (e.g. ochid: /changeID).
+# other-repo is the relative path to the counterpart repo.
+
+[workspace]
+path = "/"
+other-repo = ".claude"
