@@ -6,6 +6,6 @@ $ cat .vc-config.toml
 # other-repo is the relative path to the counterpart repo.
 
 [workspace]
-version = "0.1.0"
+version = "0.2.0"
 path = "/"
 other-repo = ".claude"

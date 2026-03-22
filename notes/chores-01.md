@@ -195,3 +195,159 @@ A Rust port of autoresearch would need to address several layers:
      to implement Flash Attention, Muon optimizer, and the full model
      from scratch. Educational but significant effort
 
+## Can autoresearch be ported to Rust? (20260322 0.2.0)
+
+### Answer: Yes, but the scope varies dramatically by approach
+
+The Python code has three distinct layers with different porting
+profiles. A full port is feasible with **Burn** as the framework,
+but requires implementing the Muon optimizer from scratch. A hybrid
+approach (Rust orchestrator + Python training) gives immediate value
+with minimal risk.
+
+### Layer-by-layer analysis
+
+#### 1. Agent loop (`program.md` logic) — trivial to port
+
+The experiment orchestration is just file I/O, git/jj operations,
+process spawning, log parsing, and TSV writing. Rust excels at all
+of this. No ML dependencies needed.
+
+#### 2. Data pipeline (`prepare.py`) — solved in Rust
+
+| Component | Python | Rust equivalent | Status |
+|-----------|--------|-----------------|--------|
+| Parquet reading | `pyarrow` | `arrow-rs` / `parquet` | Production-grade, used by DataFusion/Polars |
+| BPE tokenizer | `rustbpe` + `tiktoken` | `tokenizers` (HuggingFace) or `rustbpe` directly | Already Rust under the hood |
+| Dataloader | Custom with pinned memory | Manual via `cudarc` or Burn's data API | Needs custom work for async GPU transfer |
+| BPB evaluation | NumPy/PyTorch | Burn or Candle tensor ops | Straightforward |
+
+The data pipeline is the easiest layer — the key crates (`arrow-rs`,
+`tokenizers`) are battle-tested and widely used in production.
+
+#### 3. Training script (`train.py`) — the hard part
+
+This is where the real challenge lies. The model uses several modern
+techniques that each need a Rust equivalent:
+
+**Feature availability in Rust ML frameworks:**
+
+| Feature | Burn | Candle | tch-rs |
+|---------|------|--------|--------|
+| Autograd / backprop | Yes (`Autodiff` backend) | Yes | Yes (via libtorch) |
+| CUDA backend | Yes (CubeCL) | Yes | Yes |
+| Flash Attention | v3 (CUDA, WGPU) | v2 + v3 (CUDA only) | No |
+| bf16 mixed precision | Partial (dtype support) | Yes (`to_dtype`) | No (no AMP) |
+| RoPE | Built-in `nn::RotaryEncoding` | In model code (LLaMA etc.) | Manual |
+| Custom optimizers | Trait-based system | Trait-based system | Limited |
+| `torch.compile` | N/A (CubeCL does kernel fusion) | N/A | No |
+| Training infra | Strong (TUI dashboard, checkpoints) | Basic | Basic |
+| Multi-GPU | Yes (NCCL) | Yes (NCCL) | Yes |
+
+**What does NOT exist in Rust today:**
+
+- **Muon optimizer** — no Rust implementation anywhere. Must be ported
+  manually. The core algorithm is Newton-Schulz orthogonalization
+  (5 iterations with hardcoded polynomial coefficients) plus Nesterov
+  momentum and NorMuon variance reduction. All expressible in standard
+  tensor ops, but ~150 lines of non-trivial math to port and validate
+- **`torch.compile` equivalent** — Burn's CubeCL provides framework-level
+  kernel fusion, which covers some of the same ground but is not
+  user-controllable
+- **Mature GPT training pipelines** — `femtoGPT` exists (pure Rust,
+  OpenCL) but is educational-scale, not production
+
+**Component-by-component porting map for `train.py`:**
+
+| Component | Lines | Porting difficulty | Notes |
+|-----------|-------|-------------------|-------|
+| `GPTConfig` | ~10 | Trivial | Struct definition |
+| `norm` (RMSNorm) | 2 | Easy | `F.rms_norm` → Burn/Candle equivalent |
+| `apply_rotary_emb` | 6 | Easy | Burn has built-in `RotaryEncoding` |
+| `CausalSelfAttention` | 36 | Medium | Flash Attention available in Burn; value embedding gate logic is custom |
+| `MLP` | 10 | Easy | Linear + squared ReLU |
+| `Block` / `GPT` | 80 | Medium | Pre-norm residual blocks, `resid_lambda`/`x0_lambda` scaling, window size computation |
+| `GPT.forward` | 25 | Medium | Logit softcapping, conditional value embeddings |
+| `GPT.init_weights` | 30 | Medium | Custom initialization patterns |
+| `MuonAdamW` optimizer | 120 | Hard | Polar Express orthogonalization, NorMuon variance reduction, cautious weight decay. No existing Rust impl |
+| `adamw_step_fused` | 8 | Medium | Fused kernel — need Burn's equivalent or manual CUDA |
+| `muon_step_fused` | 35 | Hard | Stacked tensor operations, polar decomposition loop |
+| Training loop | 60 | Medium | Time-based scheduling, gradient accumulation, GC tricks (N/A in Rust) |
+| LR/momentum schedules | 15 | Easy | Pure math |
+
+### Framework recommendation: Burn
+
+**Burn is the strongest candidate** for a full Rust port:
+
+- Flash Attention v3 built-in (matches the Python version)
+- RoPE built-in
+- Autograd works transparently via `Autodiff` backend decorator
+- CubeCL compiles kernels for CUDA, ROCm, Metal, Vulkan, WebGPU —
+  the Rust version would run on more hardware than the Python original
+- Training infrastructure (dashboards, checkpoints) included
+- Active development with growing community
+
+**Candle** is viable if CUDA-only is acceptable and you prefer an API
+closer to PyTorch's feel. Less training infrastructure.
+
+**tch-rs** is a poor fit — it wraps PyTorch's C++ API but loses the
+modern Python-side features (Flash Attention, torch.compile, AMP)
+that make the training script competitive.
+
+### Practical approaches (ranked by risk)
+
+#### Approach A: Rust orchestrator + Python training (lowest risk)
+
+Port the agent loop to Rust, keep `train.py` as-is. The Rust binary
+manages experiments, parses results, handles git operations, and
+spawns `uv run train.py` as a subprocess.
+
+- **Effort:** ~1-2 weeks
+- **Value:** Type-safe experiment management, better error handling,
+  concurrent experiment scheduling, structured logging
+- **Risk:** Minimal — Python training is proven
+- **Limitation:** Still depends on Python/PyTorch runtime
+
+#### Approach B: Full Rust via Burn (highest ambition)
+
+Port everything to Burn. The model architecture maps cleanly; the
+main work is implementing MuonAdamW and validating numerical
+equivalence.
+
+- **Effort:** ~4-8 weeks
+- **Value:** Single-binary deployment, no Python dependency, runs on
+  more GPU vendors via CubeCL, Rust's safety guarantees
+- **Risk:** Medium-high — Burn is pre-1.0, you'd be an early adopter
+  for serious training workloads. Numerical validation against
+  PyTorch is essential
+- **Key milestones:**
+  1. Port model architecture + AdamW-only training (validate loss curves)
+  2. Implement Muon optimizer (validate against Python on small runs)
+  3. Port data pipeline (parquet + tokenizer + packing dataloader)
+  4. Integrate agent loop
+  5. Run head-to-head comparison vs Python version
+
+#### Approach C: Hybrid — Burn model + cudarc for hot paths
+
+Use Burn for the model and autograd, but call Flash Attention and
+Muon's orthogonalization kernels via `cudarc` (raw CUDA kernel
+launches). Trades portability for performance certainty.
+
+- **Effort:** ~6-10 weeks
+- **Value:** Maximum GPU performance, Rust safety for everything
+  except kernel code
+- **Risk:** High — managing the boundary between Burn tensors and
+  raw CUDA buffers is error-prone
+
+### Conclusion
+
+**Yes, the Python code can be converted to Rust.** The ecosystem has
+matured enough that all major components have Rust equivalents except
+the Muon optimizer (which must be ported manually). Burn is the
+recommended framework.
+
+For this project, **Approach B (full Rust via Burn)** aligns best
+with the learning goals stated in the project README. Starting with
+Approach A as a stepping stone is also reasonable — get the
+orchestrator working first, then incrementally port the training.
+

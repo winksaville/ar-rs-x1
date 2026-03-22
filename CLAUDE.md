@@ -117,13 +117,13 @@ Before proposing a commit, run all of the following and fix any issues:
 
 Every commit body must include an `ochid:` trailer pointing to the
 counterpart commit in the other repo. The value is a workspace-root-relative
-path followed by the changeID:
+path followed by the **full 12-character changeID**:
 
 - App repo commits point to `.claude`: `ochid: /.claude/<changeID>`
 - Bot session commits point to app repo: `ochid: /<changeID>`
 
 Use `vc-x1 chid -R .,.claude -L` to get both changeIDs (first line
-is app repo, second is `.claude`).
+is app repo, second is `.claude`). Use all 12 characters.
 
 ## Session End Workflows
 
